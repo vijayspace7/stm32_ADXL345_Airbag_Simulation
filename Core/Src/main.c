@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include<string.h>
 #include<stdio.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +36,10 @@
 /* USER CODE BEGIN PD */
 #define ADXL345_ADDR      (0x53 << 1)
 #define ADXL345_DEVID_REG 0x00
+#define ADXL345_BW_RATE      0x2C
+#define ADXL345_POWER_CTL    0x2D
+#define ADXL345_DATA_FORMAT  0x31
+#define ADXL345_DATAX0       0x32
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,6 +60,12 @@ osThreadId SensorTaskHandle;
 volatile uint8_t adxl345_ready = 0;
 volatile uint8_t adxl345_devid = 0;
 volatile uint8_t adxl345_id_ok = 0;
+volatile int16_t adxl_x = 0;
+volatile int16_t adxl_y = 0;
+volatile int16_t adxl_z = 0;
+volatile uint8_t adxl345_config_ok = 0;
+volatile uint8_t deploy_flag = 0;
+volatile int32_t shock_metric = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -368,11 +379,19 @@ void StartLedTask(void const * argument)
 {
   /* USER CODE BEGIN StartLedTask */
   /* Infinite loop */
-  for(;;)
-  {
-	    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	    osDelay(500);
-  }
+	for(;;)
+	  {
+	    if (deploy_flag)
+	    {
+	      HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+	      osDelay(100);
+	    }
+	    else
+	    {
+	      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+	      osDelay(500);
+	    }
+	  }
   /* USER CODE END StartLedTask */
 }
 
@@ -387,30 +406,31 @@ void StartDebugTask(void const * argument)
 {
   /* USER CODE BEGIN StartDebugTask */
   /* Infinite loop */
-	 char msg[80];
+	char msg[140];
 
 	  for(;;)
 	  {
-	    if (adxl345_ready)
-	    {
-	      if (adxl345_id_ok)
-	      {
-	        sprintf(msg, "ADXL345 detected, DEVID = 0x%02X\r\n", adxl345_devid);
-	      }
-	      else
-	      {
-	        sprintf(msg, "ADXL345 detected, unexpected DEVID = 0x%02X\r\n", adxl345_devid);
-	      }
-	    }
-	    else
+	    if (!adxl345_ready)
 	    {
 	      sprintf(msg, "ADXL345 not detected\r\n");
 	    }
+	    else if (!adxl345_id_ok)
+	    {
+	      sprintf(msg, "ADXL345 detected, unexpected DEVID = 0x%02X\r\n", adxl345_devid);
+	    }
+	    else if (!adxl345_config_ok)
+	    {
+	      sprintf(msg, "ADXL345 detected, DEVID = 0x%02X, config failed\r\n", adxl345_devid);
+	    }
+	    else
+	    {
+	      sprintf(msg, "X=%d Y=%d Z=%d Shock=%ld Deploy=%d\r\n",
+	              adxl_x, adxl_y, adxl_z, shock_metric, deploy_flag);
+	    }
 
 	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
-	    osDelay(1000);
+	    osDelay(500);
 	  }
-
   /* USER CODE END StartDebugTask */
 }
 
@@ -425,7 +445,9 @@ void StartSensorTask(void const * argument)
 {
   /* USER CODE BEGIN StartSensorTask */
   /* Infinite loop */
-	  uint8_t devid = 0;
+	uint8_t devid = 0;
+	  uint8_t data[6];
+	  uint8_t config_data;
 
 	  for(;;)
 	  {
@@ -437,20 +459,61 @@ void StartSensorTask(void const * argument)
 	                           I2C_MEMADD_SIZE_8BIT, &devid, 1, 100) == HAL_OK)
 	      {
 	        adxl345_devid = devid;
+	        adxl345_id_ok = (devid == 0xE5) ? 1 : 0;
 
-	        if (devid == 0xE5)
+	        if (adxl345_id_ok)
 	        {
-	          adxl345_id_ok = 1;
+	          /* Set BW_RATE = 100 Hz */
+	          config_data = 0x0A;
+	          if (HAL_I2C_Mem_Write(&hi2c1, ADXL345_ADDR, ADXL345_BW_RATE,
+	                                I2C_MEMADD_SIZE_8BIT, &config_data, 1, 100) != HAL_OK)
+	          {
+	            adxl345_config_ok = 0;
+	            osDelay(1000);
+	            continue;
+	          }
+
+	          /* Set DATA_FORMAT = full resolution, ±16g */
+	          config_data = 0x0B;
+	          if (HAL_I2C_Mem_Write(&hi2c1, ADXL345_ADDR, ADXL345_DATA_FORMAT,
+	                                I2C_MEMADD_SIZE_8BIT, &config_data, 1, 100) != HAL_OK)
+	          {
+	            adxl345_config_ok = 0;
+	            osDelay(1000);
+	            continue;
+	          }
+
+	          /* Set POWER_CTL = measurement mode */
+	          config_data = 0x08;
+	          if (HAL_I2C_Mem_Write(&hi2c1, ADXL345_ADDR, ADXL345_POWER_CTL,
+	                                I2C_MEMADD_SIZE_8BIT, &config_data, 1, 100) != HAL_OK)
+	          {
+	            adxl345_config_ok = 0;
+	            osDelay(1000);
+	            continue;
+	          }
+
+	          adxl345_config_ok = 1;
+
+	          /* Read X, Y, Z data */
+	          if (HAL_I2C_Mem_Read(&hi2c1, ADXL345_ADDR, ADXL345_DATAX0,
+	                               I2C_MEMADD_SIZE_8BIT, data, 6, 100) == HAL_OK)
+	          {
+	            adxl_x = (int16_t)((data[1] << 8) | data[0]);
+	            adxl_y = (int16_t)((data[3] << 8) | data[2]);
+	            adxl_z = (int16_t)((data[5] << 8) | data[4]);
+	          }
 	        }
 	        else
 	        {
-	          adxl345_id_ok = 0;
+	          adxl345_config_ok = 0;
 	        }
 	      }
 	      else
 	      {
 	        adxl345_devid = 0;
 	        adxl345_id_ok = 0;
+	        adxl345_config_ok = 0;
 	      }
 	    }
 	    else
@@ -458,9 +521,23 @@ void StartSensorTask(void const * argument)
 	      adxl345_ready = 0;
 	      adxl345_devid = 0;
 	      adxl345_id_ok = 0;
+	      adxl345_config_ok = 0;
 	    }
+  if (HAL_I2C_Mem_Read(&hi2c1, ADXL345_ADDR, ADXL345_DATAX0,
+                             I2C_MEMADD_SIZE_8BIT, data, 6, 100) == HAL_OK)
+        {
+          adxl_x = (int16_t)((data[1] << 8) | data[0]);
+          adxl_y = (int16_t)((data[3] << 8) | data[2]);
+          adxl_z = (int16_t)((data[5] << 8) | data[4]);
 
-	    osDelay(1000);
+          shock_metric = abs(adxl_x) + abs(adxl_y) + abs(adxl_z);
+
+          if (shock_metric > 700)
+          {
+            deploy_flag = 1;
+          }
+        }
+	    osDelay(200);
 	  }
   /* USER CODE END StartSensorTask */
 }
